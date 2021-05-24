@@ -1545,7 +1545,10 @@
 (define (expand-update-operator- op op= lhs rhs declT)
   (let* ((e      (remove-argument-side-effects lhs))
          (newlhs (car e))
-         (temp   (and (eq? op= '|.=|) (pair? newlhs) (not (eq? (car newlhs) 'ref))
+         (temp   (and (eq? op= '|.=|)
+                      (pair? newlhs)
+                      (not (or (eq? (car newlhs) 'ref)
+                               (and (eq? (car newlhs) '|.|) (length= newlhs 3))))
                       (make-ssavalue)))
          (e      (if temp
                      (cons temp (append (cdr e) (list `(= ,temp ,newlhs))))
@@ -1596,7 +1599,7 @@
                    ,(expand-update-operator op op= (car e) rhs T))))
         (else
          (if (and (pair? lhs) (eq? op= '=)
-                  (not (memq (car lhs) '(|.| tuple vcat typed_hcat typed_vcat))))
+                  (not (memq (car lhs) '(|.| tuple vcat ncat typed_hcat typed_vcat typed_ncat))))
              (error (string "invalid assignment location \"" (deparse lhs) "\"")))
          (expand-update-operator- op op= lhs rhs declT))))
 
@@ -1742,13 +1745,15 @@
          gen))))
 
 (define (ref-to-view expr)
-  (if (and (pair? expr) (eq? (car expr) 'ref))
-      (let* ((ex (partially-expand-ref expr))
-             (stmts (butlast (cdr ex)))
-             (refex (last    (cdr ex)))
-             (nuref `(call (top dotview) ,(caddr refex) ,@(cdddr refex))))
-        `(block ,@stmts ,nuref))
-      expr))
+  (cond ((and (pair? expr) (eq? (car expr) 'ref))
+         (let* ((ex (partially-expand-ref expr))
+                (stmts (butlast (cdr ex)))
+                (refex (last    (cdr ex)))
+                (nuref `(call (top dotview) ,(caddr refex) ,@(cdddr refex))))
+           `(block ,@stmts ,nuref)))
+        ((and (length= expr 3) (eq? (car expr) '|.|))
+         `(call (top dotgetproperty) ,(cadr expr) ,(caddr expr)))
+        (else expr)))
 
 ; lazily fuse nested calls to expr == f.(args...) into a single broadcast call,
 ; or a broadcast! call if lhs is non-null.
@@ -1799,6 +1804,10 @@
                      e))))
           ((and (pair? e) (eq? (car e) 'comparison))
            (dot-to-fuse (expand-compare-chain (cdr e)) top))
+          ((and (pair? e) (eq? (car e) '.&&))
+           (make-fuse '(top andand) (cdr e)))
+          ((and (pair? e) (eq? (car e) '|.\|\||))
+           (make-fuse '(top oror) (cdr e)))
           (else e)))
   (let ((e (dot-to-fuse rhs #t)) ; an expression '(fuse func args) if expr is a dot call
         (lhs-view (ref-to-view lhs))) ; x[...] expressions on lhs turn in to view(x, ...) to update x in-place
@@ -1967,6 +1976,113 @@
                           ,@(apply append rows))))
              `(call ,@vcat ,@a))))))
 
+(define (expand-ncat e (hvncat '((top hvncat))))
+  (define (is-row a) (and (pair? a)
+                          (or (eq? (car a) 'row)
+                              (eq? (car a) 'nrow))))
+  (define (is-1d a) (not (any is-row a)))
+  (define (sum xs) (foldl + 0 xs))
+  (define (get-shape a is-row-first d)
+    (define (zip xss) (apply map list xss))
+    (define (get-next x)
+      (cond ((or (not (is-row x))
+                 (and (eq? (car x) 'nrow) (> d (1+ (cadr x))))
+                 (and (eq? (car x) 'row) (> d 1)))
+             (list x))
+            ((eq? (car x) 'nrow) (cddr x))
+            (else (cdr x))))
+    ; describe the shape of the concatenation
+    (cond ((or (= d 0)
+               (and (not is-row-first) (= d 1)))
+           (length a))
+          ((and is-row-first (= d 3))
+           (get-shape a is-row-first (1- d)))
+          (else
+           (let ((ashape
+                 (map (lambda (x)
+                        (get-shape (get-next x) is-row-first (1- d)))
+                      a)))
+             (if (pair? (car ashape))
+                 (let ((zipashape (zip ashape)))
+                   (cons (sum (car zipashape))
+                         (cons (car zipashape)
+                               (map (lambda (x)
+                                      (apply append x))
+                                    (cdr zipashape)))))
+                 (list (sum ashape) ashape))))))
+  (define (get-dims a is-row-first d)
+    (cond ((and (< d 2) (not (is-row (car a))))
+           (list (length a)))
+          ((= d 1)
+           (list (car (get-dims (cdar a) is-row-first 0)) (length a)))
+          ((and (= d 3) is-row-first)
+           (get-dims a is-row-first 2))
+          (else
+           (let ((anext (if (and (pair? (car a))
+                                 (eq? (caar a) 'nrow)
+                                 (= d (1+ (cadar a))))
+                            (cddar a)
+                            (list (car a)))))
+             (cons (length a) (get-dims anext is-row-first (1- d)))))))
+  (define (is-balanced s)
+    ; determine whether there are exactly the same number of elements along each axis
+    (= 0 (sum (map (lambda (x y)
+                     (sum (map (lambda (z)
+                                 (- z y))
+                               x)))
+                   (cdr s) (map car (cdr s))))))
+  (define (hasrows-flatten a)
+    ; (car <result>) stores if a row was observed
+    (foldl (lambda (x y)
+             (let ((r (car y))
+                   (yt (cdr y)))
+               (if (is-row x)
+                   (if (eq? (car x) 'nrow)
+                       (let* ((raflat (append (hasrows-flatten (cddr x))))
+                              (aflat (cdr raflat))
+                              (rinner (car raflat))
+                              (r (if (null? (or r rinner))
+                                     (and r rinner)
+                                     r)))
+                         (if (and (not (null? r))
+                                  (or (null? rinner) (and (not r) rinner))
+                                  (and (= (cadr x) 2) r))
+                             (error "cannot mix space and ;; separators in an array expression, except to wrap a line"))
+                         (cons (if (and (= (cadr x) 2) (null? r))
+                                   #f
+                                   r)
+                               (append aflat yt)))
+                     (if (or (null? r) r)
+                         (cons #t (append (reverse (cdr x)) yt))
+                         (error "cannot mix space and ;; separators in an array expression, except to wrap a line")))
+                 (cons r (cons x yt)))))
+           (list '()) a))
+  (define (tf a) (if a '(true) '(false)))
+  (define (tuplize s)
+    (cons 'tuple (reverse (map (lambda (x)
+                                 (cons 'tuple x))
+                               (cons (list (car s)) (cdr s))))))
+  (let* ((d (cadr e))
+         (a (cddr e))
+         (raflat (hasrows-flatten a))
+         (r (car raflat))
+         (is-row-first (if (null? r) #f r))
+         (aflat (reverse (cdr raflat))))
+    (if (any assignment? aflat)
+        (error (string "misplaced assignment statement in \"" (deparse e) "\"")))
+    (if (has-parameters? aflat)
+        (error "unexpected parameters in array expression"))
+    (expand-forms
+      (if (is-1d a)
+          `(call ,@hvncat ,d ,@aflat)
+          (if (any vararg? aflat)
+              (error (string "Splatting ... in an hvncat with multiple dimensions is not supported"))
+              (let ((shape (get-shape a is-row-first d)))
+                (if (is-balanced shape)
+                    (let ((dims `(tuple ,@(reverse (get-dims a is-row-first d)))))
+                     `(call ,@hvncat ,dims ,(tf is-row-first) ,@aflat))
+                    `(call ,@hvncat ,(tuplize shape) ,(tf is-row-first) ,@aflat))))))))
+
 (define (expand-property-destruct lhss x)
   (if (not (length= lhss 1))
       (error (string "invalid assignment location \"" (deparse lhs) "\"")))
@@ -2120,6 +2236,11 @@
          ;; e = (|.| f x)
          (expand-fuse-broadcast '() e)))
 
+   '.&&
+   (lambda (e) (expand-fuse-broadcast '() e))
+   '|.\|\||
+   (lambda (e) (expand-fuse-broadcast '() e))
+
    '.=
    (lambda (e)
      (expand-fuse-broadcast (cadr e) (caddr e)))
@@ -2206,7 +2327,7 @@
                 (expand-tuple-destruct lhss x))))
          ((typed_hcat)
           (error "invalid spacing in left side of indexed assignment"))
-         ((typed_vcat)
+         ((typed_vcat typed_ncat)
           (error "unexpected \";\" in left side of indexed assignment"))
          ((ref)
           ;; (= (ref a . idxs) rhs)
@@ -2243,7 +2364,7 @@
                `(block ,@(cdr e)
                        (decl ,(car e) ,T)
                        (= ,(car e) ,rhs))))))
-         ((vcat)
+         ((vcat ncat)
           ;; (= (vcat . args) rhs)
           (error "use \"(a, b) = ...\" to assign multiple values"))
          (else
@@ -2379,11 +2500,12 @@
    'string
    (lambda (e)
      (expand-forms
-      `(call (top string) ,@(map (lambda (s)
-                                   (if (and (pair? s) (eq? (car s) 'string))
-                                       (cadr s)
-                                       s))
-                                 (cdr e)))))
+       `(call (top string)
+              ,@(map (lambda (s)
+                       (if (and (length= s 2) (eq? (car s) 'string) (string? (cadr s)))
+                           (cadr s)
+                           s))
+                     (cdr e)))))
 
    '|::|
    (lambda (e)
@@ -2478,6 +2600,8 @@
 
    'vcat expand-vcat
 
+   'ncat expand-ncat
+
    'typed_hcat
    (lambda (e)
      (if (any assignment? (cddr e))
@@ -2489,6 +2613,12 @@
      (let ((t (cadr e))
            (e (cdr e)))
        (expand-vcat e `((top typed_vcat) ,t) `((top typed_hvcat) ,t) `((top typed_hvcat_rows) ,t))))
+
+   'typed_ncat
+   (lambda (e)
+     (let ((t (cadr e))
+           (e (cdr e)))
+       (expand-ncat e `((top typed_hvncat) ,t))))
 
    '|'|  (lambda (e) (expand-forms `(call |'| ,(cadr e))))
 
@@ -3605,7 +3735,7 @@ f(x) = yt(x)
                                            v)))
                                    cvs)))
                `(new_opaque_closure ,(cadr e) ,isva (call (core apply_type) Union) (core Any)
-                      (opaque_closure_method ,nargs ,functionloc ,(convert-lambda lam2 (car (lam:args lam2)) #f '() (symbol-to-idx-map cvs)))
+                      (opaque_closure_method (null) ,nargs ,functionloc ,(convert-lambda lam2 (car (lam:args lam2)) #f '() (symbol-to-idx-map cvs)))
                       ,@var-exprs))))
           ((method)
            (let* ((name  (method-expr-name e))
@@ -4062,13 +4192,14 @@ f(x) = yt(x)
                   (else #f)))
           (case (car e)
             ((call new splatnew foreigncall cfunction new_opaque_closure)
+             (define (atom-or-not-tuple-call? fptr)
+               (or (atom? fptr)
+                   (not (tuple-call? fptr))))
              (let* ((args
                      (cond ((eq? (car e) 'foreigncall)
                             ;; NOTE: 2nd to 5th arguments of ccall must be left in place
                             ;;       the 1st should be compiled if an atom.
-                            (append (if (let ((fptr (cadr e)))
-                                          (or (atom? fptr)
-                                              (not (tuple-call? fptr))))
+                            (append (if (atom-or-not-tuple-call? (cadr e))
                                         (compile-args (list (cadr e)) break-labels)
                                         (list (cadr e)))
                                     (list-head (cddr e) 4)
@@ -4080,19 +4211,22 @@ f(x) = yt(x)
                               (cons (cadr e) (cons fptr (cdddr e)))))
                            ;; Leave a literal lambda in place for later global expansion
                            ((eq? (car e) 'new_opaque_closure)
-                             (let* ((oc_method (car (list-tail (cdr e) 4)))
-                                    (lambda (cadddr oc_method))
+                             (let* ((oc_method (car (list-tail (cdr e) 4))) ;; opaque_closure_method
+                                    (lambda (caddddr oc_method))
                                     (lambda (linearize lambda)))
                                 (append
                                   (compile-args (list-head (cdr e) 4) break-labels)
                                   (list (append (butlast oc_method) (list lambda)))
                                   (compile-args (list-tail (cdr e) 5) break-labels))))
-                           ;; TODO: evaluate first argument to cglobal some other way
+                           ;; NOTE: 1st argument to cglobal treated same as for ccall
                            ((and (length> e 2)
                                  (or (eq? (cadr e) 'cglobal)
                                      (equal? (cadr e) '(outerref cglobal))))
-                            (list* (cadr e) (caddr e)
-                                   (compile-args (cdddr e) break-labels)))
+                            (append (list (cadr e))
+                                    (if (atom-or-not-tuple-call? (caddr e))
+                                        (compile-args (list (caddr e)) break-labels)
+                                        (list (caddr e)))
+                                    (compile-args (cdddr e) break-labels)))
                            (else
                             (compile-args (cdr e) break-labels))))
                     (callex (cons (car e) args)))
